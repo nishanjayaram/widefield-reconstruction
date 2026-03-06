@@ -1,0 +1,18 @@
+# Generated mesh files (large binaries — regenerate with mesh/build_mesh.py)
+mesh/*.msh
+mesh/*.msh.*
+mesh/*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

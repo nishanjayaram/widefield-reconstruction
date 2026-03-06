@@ -1,0 +1,21 @@
+# Conda environment for NV-diamond stress inversion pipeline
+# Create with:  conda env create -f environment.yml
+# Activate with: conda activate dac-recon
+
+name: dac-recon
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - fenics-dolfinx          # FEniCSx FEM (includes PETSc, MUMPS, MPI)
+  - gmsh                    # meshing (Python API)
+  - python-gmsh             # gmsh Python bindings (conda-forge)
+  - meshio                  # mesh I/O (convert .msh -> XDMF for FEniCSx)
+  - numpy
+  - scipy
+  - matplotlib
+  - pyvista                 # 3-D visualisation
+  - pip
+  - pip:
+    - pyvistaqt             # interactive PyVista window
