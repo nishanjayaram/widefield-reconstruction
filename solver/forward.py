@@ -38,7 +38,7 @@ from mpi4py import MPI
 import dolfinx
 import dolfinx.fem as fem
 import dolfinx.geometry as geo
-from dolfinx.io import gmshio
+from dolfinx.io import gmsh as gmshio
 import dolfinx.fem.petsc as fem_petsc
 import ufl
 from petsc4py import PETSc
@@ -89,9 +89,12 @@ class ForwardSolver:
         # ------------------------------------------------------------------ #
         if verbose:
             print(f"Loading mesh: {self.mesh_path}")
-        self.mesh, self.cell_tags, self.facet_tags = gmshio.read_from_msh(
+        mesh_data = gmshio.read_from_msh(
             str(self.mesh_path), self.comm, rank=0, gdim=3
         )
+        self.mesh       = mesh_data.mesh
+        self.cell_tags  = mesh_data.cell_tags
+        self.facet_tags = mesh_data.facet_tags
         if verbose:
             num_cells = self.mesh.topology.index_map(
                 self.mesh.topology.dim).size_global
@@ -238,7 +241,7 @@ class ForwardSolver:
         fem_petsc.set_bc(b, [self.bc])
 
         u = fem.Function(self.V)
-        self.ksp.solve(b, u.vector)
+        self.ksp.solve(b, u.x.petsc_vec)
         u.x.scatter_forward()
         return u
 
@@ -311,7 +314,7 @@ class ForwardSolver:
         """
         sigma_expr = fem.Expression(
             self._sigma(u),
-            self.V_S.element.interpolation_points(),
+            self.V_S.element.interpolation_points,
         )
         sigma_h = fem.Function(self.V_S)
         sigma_h.interpolate(sigma_expr)
@@ -359,8 +362,7 @@ class ForwardSolver:
                 continue
             # Use first colliding cell
             val = sigma_h.eval(pt.reshape(1, 3), cells_i[:1])
-            # val shape: (1, 9) for a (3,3) tensor flattened row-major
-            s = val[0].reshape(3, 3)
+            s = np.reshape(val, 9).reshape(3, 3)  # normalise shape
             # Pack into Voigt order: [s11, s22, s33, s12, s23, s13]
             sigma_voigt[i] = [
                 s[0, 0], s[1, 1], s[2, 2],
@@ -409,7 +411,8 @@ class ForwardSolver:
         for cell, pt_idxs in cell_to_pts.items():
             pts_batch = coords[pt_idxs]
             cells_arr = np.full(len(pt_idxs), cell, dtype=np.int32)
-            vals = sigma_h.eval(pts_batch, cells_arr)  # (M, 9)
+            vals = sigma_h.eval(pts_batch, cells_arr)
+            vals = np.reshape(vals, (-1, 9))  # normalise: always (M, 9)
             for local_j, global_i in enumerate(pt_idxs):
                 s = vals[local_j].reshape(3, 3)
                 sigma_voigt[global_i] = [
