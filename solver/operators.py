@@ -217,8 +217,7 @@ class NVOperator:
         )
 
         coord_x      = mesh.geometry.x        # (N_geom, 3)
-        coord_dofmap = mesh.geometry.dofmap   # cell -> 4 geom node indices (P1 geom)
-        cmap         = mesh.geometry.cmap
+        coord_dofmap = mesh.geometry.dofmap   # cell -> geom node indices
 
         cell_cands = geo.compute_collisions_points(tree, self.pixel_coords)
         colliding  = geo.compute_colliding_cells(mesh, cell_cands, self.pixel_coords)
@@ -235,20 +234,27 @@ class NVOperator:
 
             # Geometry: tet with constant Jacobian (straight-sided element).
             # coord_dofmap returns 4 nodes for P1 geometry, 10 for P2 geometry.
-            # pull_back needs the full geometry node array; Jacobian uses only
-            # the 4 vertex nodes (indices 0-3) since midpoints are at edge midpoints.
-            x_cell = coord_x[coord_dofmap[cell]]              # (4 or 10, 3)
-            xi_m   = cmap.pull_back(self.pixel_coords[m:m+1], x_cell)  # (1, 3)
+            # We only use the 4 vertex nodes (first 4 rows) for both Jacobian
+            # and pullback, since P2 midpoints are at exact edge midpoints and
+            # all elements are straight-sided.  Using cmap.pull_back with the
+            # full P2 x_cell gives wrong xi_m on some cells (up to ~1e-3 error)
+            # because the P2 coordinate map's iterative inverse converges
+            # inconsistently.  The affine inverse J^{-1}(x-x0) is exact.
+            x_cell  = coord_x[coord_dofmap[cell]]              # (4 or 10, 3)
+            x_verts = x_cell[:4]                               # (4, 3) vertex nodes
+
+            # Jacobian: columns = edge vectors from vertex 0
+            J     = (x_verts[1:] - x_verts[0]).T              # (3, 3)
+            J_inv = np.linalg.inv(J)
+
+            # Affine pullback: exact for straight-sided tets
+            xi_m  = (J_inv @ (self.pixel_coords[m] - x_verts[0])).reshape(1, 3)
 
             # P2 basis derivatives in reference coords
             table    = fem_el.tabulate(1, xi_m)               # (4, 1, 10, 1)
             dphi_dxi = table[1:, 0, :, 0].T                   # (10, 3)
 
-            # Jacobian from the 4 vertex nodes only (straight-sided tet)
-            x_verts = x_cell[:4]                              # (4, 3)
-            J = (x_verts[1:] - x_verts[0]).T                 # (3, 3) columns = edge vectors
             # Row-vector form: (grad_x phi)^T = (grad_xi phi)^T @ J^{-1}
-            J_inv = np.linalg.inv(J)
 
             dphi_dx = dphi_dxi @ J_inv                        # (10, 3) physical gradients
             self._dphi_dx_pixels[m] = dphi_dx
@@ -362,6 +368,51 @@ class NVOperator:
     # Forward operator  A @ c                                                 #
     # ---------------------------------------------------------------------- #
 
+    def _stress_at_pixels_direct(self, u) -> np.ndarray:
+        """
+        Evaluate sigma = C : eps(u) at pixel positions using the same precomputed
+        P2 basis function gradients (dphi_dx) used by the adjoint body load.
+
+        This is the ONLY correct forward for the adjoint consistency check:
+        DOLFINx's DG1 stress evaluation uses the P2 coordinate-map pullback
+        internally, which gives wrong reference coords on some cells of P2-geometry
+        meshes.  Using dphi_dx (computed from the exact affine pullback) makes
+        forward and adjoint perfectly consistent.
+
+        Returns (N_meas, 6) Voigt stress [GPa].
+        """
+        u_arr = u.x.array
+        bs    = self.solver.V.dofmap.index_map_bs
+        dm    = self.solver.V.dofmap
+        C4    = self.solver.C4_lab
+        n_loc = len(u_arr)
+
+        sigma_v = np.zeros((self.N_meas, 6))
+        for m in range(self.N_meas):
+            cell = self._cell_of_pixel[m]
+            if cell < 0:
+                continue
+            cell_dofs = dm.cell_dofs(cell)   # (10,) block DOFs
+            dphi_dx   = self._dphi_dx_pixels[m]   # (10, 3)
+
+            # u_cell[i, a] = u_a at the i-th P2 node of this cell
+            u_cell = np.zeros((10, 3))
+            for i in range(10):
+                base = int(cell_dofs[i]) * bs
+                for a in range(3):
+                    sd = base + a
+                    if sd < n_loc:
+                        u_cell[i, a] = u_arr[sd]
+
+            # grad_u[a, l] = sum_i dphi_dx[i, l] * u_cell[i, a]
+            grad_u = u_cell.T @ dphi_dx   # (3, 3)
+            eps    = (grad_u + grad_u.T) / 2.0
+            sigma  = np.einsum("ijkl,kl->ij", C4, eps)
+            for I, (i, j) in enumerate(_VOIGT):
+                sigma_v[m, I] = sigma[i, j]
+
+        return sigma_v
+
     def matvec(self, c: np.ndarray) -> np.ndarray:
         """
         A @ c  — one MUMPS back-substitution.
@@ -375,7 +426,7 @@ class NVOperator:
         b = self._traction_to_load_vector(t_nodes)
         u = self.solver.solve_load_vector(b)
 
-        sigma_v = self.solver.stress_at_coords_batch(u, self.pixel_coords)
+        sigma_v = self._stress_at_pixels_direct(u)
         sigma_v = np.where(np.isnan(sigma_v), 0.0, sigma_v)
 
         # D[m, g] = sigma_v[m] @ M_voigt[g]  ->  shape (N_meas, 4)
