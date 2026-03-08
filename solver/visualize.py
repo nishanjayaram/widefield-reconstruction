@@ -25,6 +25,8 @@ matplotlib.use("Agg")   # non-interactive backend
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib.colors import TwoSlopeNorm
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +84,96 @@ def plot_stress_maps(sigma_voigt: np.ndarray, coords: np.ndarray, out_dir: Path)
     print(f"  Saved: {out}")
 
 
+def _to_grid(x, y, v, spacing=2.0, smooth_sigma=2.0):
+    """
+    Interpolate scattered (x,y,v) onto a regular grid and apply Gaussian smoothing.
+
+    The FEM stress is piecewise-linear (P1 within each ~5 µm element) and
+    discontinuous across element boundaries.  Griddata faithfully captures
+    those jumps, making the map look blocky.  A Gaussian filter with
+    smooth_sigma (in grid cells, so σ_physical = sigma * spacing µm) removes
+    element-boundary artifacts while preserving features at the traction-grid
+    scale (~10 µm).
+    """
+    gx = np.arange(x.min(), x.max() + spacing, spacing)
+    gy = np.arange(y.min(), y.max() + spacing, spacing)
+    GX, GY = np.meshgrid(gx, gy)
+    VG = griddata(np.c_[x, y], v, (GX, GY), method="linear")
+
+    if smooth_sigma > 0:
+        mask = np.isnan(VG)
+        # Fill NaN with mean before filtering so boundaries don't bleed
+        fill = np.where(mask, np.nanmean(VG), VG)
+        VG = gaussian_filter(fill, sigma=smooth_sigma)
+        VG[mask] = np.nan   # restore boundary NaNs
+
+    return GX, GY, VG
+
+
 def plot_sigma_zz(sigma_voigt: np.ndarray, coords: np.ndarray, out_dir: Path) -> None:
-    """High-res σ_zz map."""
+    """σ_zz map — gridded, viridis, fixed colorbar 16–28 GPa."""
     x, y = coords[:, 0], coords[:, 1]
+    GX, GY, VG = _to_grid(x, y, sigma_voigt[:, 2], spacing=2.0)
     fig, ax = plt.subplots(figsize=(7, 6))
-    scatter_map(ax, x, y, sigma_voigt[:, 2], "σ_zz (normal stress on culet)",
-                cmap="RdBu_r", symmetric=True, unit="GPa")
+    im = ax.pcolormesh(GX, GY, VG, cmap="viridis", vmin=16, vmax=28,
+                       shading="auto", rasterized=True)
+    plt.colorbar(im, ax=ax, label="σ_zz (GPa)", fraction=0.046, pad=0.04)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x (µm)")
+    ax.set_ylabel("y (µm)")
+    ax.set_title("σ_zz (normal stress on culet)")
     fig.tight_layout()
     out = out_dir / "sigma_zz.pdf"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+
+def plot_tau(sigma_voigt: np.ndarray, coords: np.ndarray, out_dir: Path) -> None:
+    """
+    In-plane shear traction magnitude |τ| = sqrt(σ_xz² + σ_yz²) with quiver arrows.
+
+    Voigt convention:
+      sigma_voigt[:, 4] = σ_yz  (index 4: (1,2))
+      sigma_voigt[:, 5] = σ_xz  (index 5: (0,2))
+    """
+    x, y = coords[:, 0], coords[:, 1]
+    tau_x = sigma_voigt[:, 5]   # σ_xz
+    tau_y = sigma_voigt[:, 4]   # σ_yz
+    tau_mag = np.sqrt(tau_x**2 + tau_y**2)
+
+    # Background: gridded magnitude
+    GX, GY, MG = _to_grid(x, y, tau_mag, spacing=2.0)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.pcolormesh(GX, GY, MG, cmap="viridis", vmin=0, vmax=8,
+                       shading="auto", rasterized=True)
+    plt.colorbar(im, ax=ax, label="|τ| (GPa)", fraction=0.046, pad=0.04)
+
+    # Quiver: coarser grid (8 µm spacing), unit-length arrows
+    arrow_spacing = 8.0
+    _, _, TX = _to_grid(x, y, tau_x, spacing=arrow_spacing)
+    _, _, TY = _to_grid(x, y, tau_y, spacing=arrow_spacing)
+    agx = np.arange(x.min(), x.max() + arrow_spacing, arrow_spacing)
+    agy = np.arange(y.min(), y.max() + arrow_spacing, arrow_spacing)
+    AGX, AGY = np.meshgrid(agx, agy)
+
+    valid = np.isfinite(TX) & np.isfinite(TY)
+    mag_a = np.sqrt(TX**2 + TY**2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ux = np.where(valid & (mag_a > 0), TX / mag_a, 0.0)
+        uy = np.where(valid & (mag_a > 0), TY / mag_a, 0.0)
+
+    ax.quiver(AGX[valid], AGY[valid], ux[valid], uy[valid],
+              color="black", scale=30, width=0.003, headwidth=3, headlength=4,
+              pivot="middle", alpha=0.7)
+
+    ax.set_aspect("equal")
+    ax.set_xlabel("x (µm)")
+    ax.set_ylabel("y (µm)")
+    ax.set_title(r"|τ| = $\sqrt{σ_{xz}^2 + σ_{yz}^2}$ (in-plane shear traction)")
+    fig.tight_layout()
+    out = out_dir / "tau.pdf"
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"  Saved: {out}")
@@ -272,6 +356,7 @@ def main():
     # Load node coordinates for traction plot (requires NVOperator)
     print("\nGenerating plots...")
     plot_sigma_zz(sigma_voigt, coords, out_dir)
+    plot_tau(sigma_voigt, coords, out_dir)
     plot_stress_maps(sigma_voigt, coords, out_dir)
     plot_Dg_comparison(D_measured, D_predicted, coords, out_dir)
     plot_Dg_scatter(D_measured, D_predicted, out_dir)
