@@ -239,15 +239,23 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Build diamond anvil mesh with Gmsh")
-    parser.add_argument(
-        "-o", "--output",
-        default="mesh/anvil.msh",
-        help="Output .msh file path (default: mesh/anvil.msh)",
-    )
-    parser.add_argument(
-        "--quiet", action="store_true",
-        help="Suppress Gmsh terminal output",
-    )
+    parser.add_argument("-o", "--output", default="mesh/anvil.msh",
+                        help="Output .msh file path (default: mesh/anvil.msh)")
+    parser.add_argument("--lc-sample", type=float, default=LC_SAMPLE,
+                        help=f"Mesh size in sample chamber (default: {LC_SAMPLE} µm)")
+    parser.add_argument("--lc-gasket", type=float, default=LC_GASKET,
+                        help=f"Mesh size in gasket/cap region (default: {LC_GASKET} µm)")
+    parser.add_argument("--lc-table", type=float, default=LC_TABLE,
+                        help=f"Mesh size in bulk (default: {LC_TABLE} µm)")
+    parser.add_argument("--tcap", type=float, default=TCAP,
+                        help=f"Cap layer thickness (default: {TCAP} µm)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress Gmsh terminal output")
     args = parser.parse_args()
+
+    LC_SAMPLE = args.lc_sample
+    LC_GASKET = args.lc_gasket
+    LC_TABLE  = args.lc_table
+    TCAP      = args.tcap
 
     build_mesh(output_path=args.output, verbose=not args.quiet)

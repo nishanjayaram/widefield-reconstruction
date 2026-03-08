@@ -180,11 +180,11 @@ def run_lsqr(
         print(f"  ||c|| = {np.linalg.norm(c):.4e} GPa")
 
     return {
-        "c":         c,
-        "t_pixels":  c.reshape(op.N_meas, 3),
-        "residual":  residual,
-        "n_iter":    itn,
-        "istop":     istop,
+        "c":       c,
+        "t_nodes": c.reshape(op.N_nodes, 3),
+        "residual": residual,
+        "n_iter":  itn,
+        "istop":   istop,
     }
 
 
@@ -217,8 +217,8 @@ def reconstruct_final_stress(
       eval_coords : (M, 3) evaluation coordinates
       D_predicted : (4, M) predicted D_g values [GHz]
     """
-    t_pixels = c.reshape(op.N_meas, 3)
-    b = op._traction_to_load_vector(t_pixels)
+    t_nodes = c.reshape(op.N_nodes, 3)
+    b = op._traction_to_load_vector(t_nodes)
     u_final = solver.solve_load_vector(b)
 
     if eval_coords is None:
@@ -281,12 +281,17 @@ def run_synthetic_test(
     op = NVOperator(solver, pixel_coords)
 
     # True traction: Gaussian bump in z-direction (normal pressure)
+    # c is now indexed by culet node (not pixel), so evaluate Gaussian at node coords.
     sigma_x0, sigma_y0 = 20.0, 15.0   # Gaussian widths (µm)
-    t_true_z = 20.0 * np.exp(-(px**2 / sigma_x0**2 + py**2 / sigma_y0**2))
+    node_coords = solver.V.tabulate_dof_coordinates()[op._culet_node_list]  # (N_nodes, 3)
+    node_x, node_y = node_coords[:, 0], node_coords[:, 1]
+    t_true_z_nodes = 20.0 * np.exp(-(node_x**2 / sigma_x0**2 + node_y**2 / sigma_y0**2))
     c_true = np.zeros(op.N_B)
-    c_true[2::3] = t_true_z   # z-component every 3rd entry
+    c_true[2::3] = t_true_z_nodes   # z-component at each node
 
-    print(f"True traction: Gaussian in z, max={t_true_z.max():.1f} GPa")
+    # For comparison with pixels, evaluate at pixel coords too
+    t_true_z = 20.0 * np.exp(-(px**2 / sigma_x0**2 + py**2 / sigma_y0**2))
+    print(f"True traction: Gaussian in z, max={t_true_z_nodes.max():.1f} GPa")
 
     # Forward: generate synthetic D_g
     d_synthetic = op.matvec(c_true)
@@ -308,15 +313,15 @@ def run_synthetic_test(
     )
 
     c_rec = result["c"]
-    t_rec_z = c_rec[2::3]
+    t_rec_z = c_rec[2::3]   # z-component at each culet node
 
-    # Recovery quality
-    corr = float(np.corrcoef(t_true_z, t_rec_z)[0, 1])
-    rms  = float(np.sqrt(np.mean((t_true_z - t_rec_z)**2)))
-    print(f"\nRecovery:")
+    # Recovery quality: compare at node positions
+    corr = float(np.corrcoef(t_true_z_nodes, t_rec_z)[0, 1])
+    rms  = float(np.sqrt(np.mean((t_true_z_nodes - t_rec_z)**2)))
+    print(f"\nRecovery (at {op.N_nodes} culet nodes):")
     print(f"  Pearson r (z-traction): {corr:.4f}")
     print(f"  RMS error:              {rms:.4f} GPa")
-    print(f"  True max t_z:           {t_true_z.max():.4f} GPa")
+    print(f"  True max t_z:           {t_true_z_nodes.max():.4f} GPa")
     print(f"  Recovered max t_z:      {t_rec_z.max():.4f} GPa")
 
     if corr > 0.8:

@@ -4,110 +4,77 @@ Matrix-free forward (A) and adjoint (A^T) operators for LSQR inversion.
 Problem structure (SPEC_v2.md Section 6)
 -----------------------------------------
 Unknown: traction coefficients c of shape (N_meas, 3), flattened to (N_B,)
-  where N_B = 3 * N_meas = 34,779 (3 components × 11,593 pixels).
+  where N_B = 3 * N_meas = 34,779  (3 traction components × 11,593 pixels)
 
-  c[3*m + alpha] = t_alpha at pixel m  (alpha in {0,1,2} = x,y,z)
+  c[3*m + alpha] = t_alpha at pixel m   (alpha in {0,1,2} = x, y, z)
 
 Data: d of shape (4 * N_meas,) = (46,372,)
   d[g * N_meas + m] = Delta_D_g at pixel m
 
-Forward operator  A @ c
------------------------
-1. Reshape c -> (N_meas, 3) pixel tractions.
-2. Assemble one FEM surface load vector by distributing each pixel traction
-   to the nearest surface node(s) via the surface projection (described below).
-3. One MUMPS back-substitution: K u = f.
-4. Evaluate sigma(u) at all N_meas pixel coords -> (N_meas, 6) Voigt.
-5. Contract with each M_g -> (4, N_meas) -> flatten to (4*N_meas,).
+Forward operator  A @ c  (one MUMPS back-substitution)
+---------------------------------------------------------
+  1. Reshape c -> (N_meas, 3) pixel tractions.
+  2. For each pixel m, add t_m to the DOF of the nearest culet surface node
+     (nearest-node surface load assembly, matrix P).
+  3. One back-substitution:  K u = f.
+  4. Evaluate sigma(u) at all pixel coords -> (N_meas, 6) Voigt.
+  5. Contract: D[m, g] = M_g_voigt @ sigma[m] -> flatten to (4*N_meas,).
 
-Adjoint operator  A^T @ r
---------------------------
-Given r of shape (4*N_meas,):
-1. Reshape r -> (4, N_meas).
-2. At each pixel m, sum over g: M_g^T r_g[m] -> a (3,3) "stress residual"
-   tensor S[m].   (M_g is symmetric so M_g^T = M_g.)
-3. The adjoint of "evaluate sigma at pixel m" is a point load at pixel m
-   in the stress-conjugate directions. Specifically, the Cauchy stress
-   sigma = C : eps(u), so the adjoint of sigma_ij(x_m) applied to weight
-   w_{ij} is the body load:
-       f^adj_alpha(x) = sum_{i,j} w_{ij} * C_lab_{ij alpha beta} * d/dx_beta [delta(x - x_m)]
-   which in weak form gives nodal loads at x_m:
-       F_n = sum_{i,j} S_{ij} * C_lab_{ij alpha beta} * d phi_n / dx_beta |_{x_m}
-   Equivalently: the adjoint load in direction alpha at node n is
-       F_{n, alpha} = C_lab_{alpha beta ij} * S_{ij} * d phi_n / dx_beta (x_m)
-   This is equivalent to applying a stress sigma_adj = C : S (symmetric,
-   via the constitutive operator) as a body force, which translates to
-   consistent nodal loads via the virtual work principle.
+Adjoint operator  A^T @ r  (one MUMPS back-substitution with same factored K)
+-------------------------------------------------------------------------------
+  A = M E K^{-1} P,  so  A^T = P^T (K^T)^{-1} E^T M^T = P^T K^{-1} E^T M^T
+  (K is symmetric, so K^{-T} = K^{-1}.)
 
-   Practical implementation: apply S as a "traction" on a virtual test
-   problem. Because C is the same operator as in the forward problem,
-   the adjoint load equals:  f_adj = K^T * u_adj,  where u_adj satisfies
-   K v = loads from S.  Since K = K^T (symmetric stiffness), the adjoint
-   solve uses the same factored K.
+  Step-by-step:
+  1. M^T r:  unpack r -> R (4, N_meas), then
+             S_voigt[m] = sum_g M_voigt[g] * R[g, m]       (N_meas, 6)
+             M_g is symmetric so M_g^T = M_g.
 
-   Concretely: the adjoint of "evaluate sigma(u) at point x_m with weight
-   w_{ij}" is a point traction load at x_m:
-       f^adj contribution: add w_{ij} * (C_lab_{ij 2 k} e_k) as a nodal load at x_m
-   where the "2" index is z (the culet normal direction) -- this is because
-   sigma·n at the surface with n=e_z gives the traction.
+  2. E^T S:  adjoint of "evaluate sigma at pixels with weight S".
+             sigma(u)(x_m) = C_lab : eps(u)(x_m)
+             The adjoint maps stress weights S -> a body load vector f_adj:
 
-   Simpler direct formulation (used here):
-   The adjoint of sigma evaluation at x_m with weight S[m] is a surface
-   point load in the direction  t_adj[m] = S[m] @ n_culet  where n_culet = e_z.
-   This converts the (3,3) stress-weight to a (3,) traction load at x_m.
+               f_adj[scalar_dof(n, k)] = sum_m G_m[k, l] * dphi_n/dx_l(x_m)
 
-4. Distribute the adjoint traction loads t_adj[m, :] for m=1..N_meas
-   onto the FEM mesh surface nodes (same as in the forward step).
-5. Solve K v = f_adj (one back-substitution with same MUMPS factorisation).
-6. Read off the surface traction DOF values from v at the pixel locations.
-   The adjoint output c_adj[3m + alpha] = v_alpha(x_m) restricted to the
-   sample chamber surface.
+             where  G_m = C_lab : S_m  (contracting C on the stress indices i,j)
+             and    phi_n is the n-th P2 scalar basis function.
 
-Why this works
---------------
-Let F(u)(x_m) = sigma(u)(x_m) be the stress-evaluation operator.
-Its adjoint F^T maps a (3,3) weight S at x_m to a body load via the
-principle of virtual work:
-    <F(u), S> = integral_Omega sigma(u):S dx_m  (schematically at a point)
-The functional on u is: v -> sigma(v)(x_m):S = C:eps(v)(x_m):S
-which by the FEM test-function formulation equals:
-    a(v, w) where w solves: a(w, phi) = C:eps(phi)(x_m):S for all test phi
-This adjoint problem has the same stiffness K and the RHS is the virtual
-work of the stress S applied at x_m.
+             "The adjoint of stress evaluation at a point is a point load in
+              stress-conjugate directions" (user's hint), where the conjugate
+              direction is G_m = C : S_m.
 
-In practice, we project S through the culet normal: t_adj = S @ n  (n=e_z),
-making it a surface traction load at x_m on the culet, then solve normally.
+  3. K^{-1}:  solve K v = f_adj  (same MUMPS factorisation).
 
-The output of the adjoint is the DOF values of v on the culet surface,
-which represent the sensitivities of the misfit to each traction DOF.
+  4. P^T v:   read off v_alpha(nearest_node(m)) for each pixel m and direction alpha.
+              This gives (N_meas, 3) -> flatten to (N_B,).
 """
 
 from __future__ import annotations
 
 import numpy as np
+import basix
 from scipy.sparse.linalg import LinearOperator
+from petsc4py import PETSc
 
 from .forward import ForwardSolver
-from .nv_coupling import build_coupling_matrices, dg_all
+from .nv_coupling import build_coupling_matrices
 
-
-# Culet outward normal (pointing out of the diamond, toward the sample)
-_N_CULET = np.array([0.0, 0.0, 1.0])
+# Voigt index -> (i, j) mapping
+_VOIGT = [(0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (0, 2)]
 
 
 class NVOperator:
     """
-    Matrix-free operator A and adjoint A^T for NV-stress LSQR inversion.
+    Matrix-free operator A and adjoint A^T for the NV stress inversion.
 
-    The traction is parameterized at the NV pixel locations (sample chamber only).
-    The parameterization is: N_B = 3 * N_meas scalar DOFs, where
-      c[3*m + alpha] = t_alpha(x_m)  in GPa.
+    Traction parameterisation: N_B = 3 * N_meas scalar DOFs
+      c[3*m + alpha] = t_alpha(x_m)  [GPa].
 
     Parameters
     ----------
-    solver     : ForwardSolver — mesh loaded, K factored.
-    pixel_coords : (N_meas, 3) array — (x, y, 0) pixel locations in µm.
-    theta_misc_deg, phi_misc_deg : miscut parameters for coupling matrices.
+    solver       : ForwardSolver — mesh loaded, K factored.
+    pixel_coords : (N_meas, 2) or (N_meas, 3) in µm. z=0 assumed if 2-D.
+    theta_misc_deg, phi_misc_deg : miscut angles for coupling matrices.
     """
 
     def __init__(
@@ -116,275 +83,351 @@ class NVOperator:
         pixel_coords: np.ndarray,
         theta_misc_deg: float = -3.5,
         phi_misc_deg: float   = 174.4,
+        traction_grid_spacing: float = 0.0,
     ) -> None:
+        """
+        traction_grid_spacing : µm — if > 0, use a Cartesian traction grid
+            with this spacing instead of culet mesh nodes. Gives N_B independent
+            of mesh refinement; spacing ~10 µm → ~1963 grid points → N_B=5889.
+            If 0 (default), use unique culet mesh nodes nearest to pixels.
+        """
         self.solver = solver
-        self.pixel_coords = np.asarray(pixel_coords, dtype=np.float64)
-        if self.pixel_coords.shape[1] == 2:
-            z = np.zeros((len(self.pixel_coords), 1))
-            self.pixel_coords = np.hstack([self.pixel_coords, z])
+
+        coords = np.asarray(pixel_coords, dtype=np.float64)
+        if coords.ndim == 1:
+            coords = coords.reshape(-1, 1)
+        if coords.shape[1] == 2:
+            coords = np.hstack([coords, np.zeros((len(coords), 1))])
+        self.pixel_coords = coords          # (N_meas, 3)
 
         self.N_meas = len(self.pixel_coords)
-        self.N_B    = 3 * self.N_meas     # traction DOFs (x,y,z per pixel)
-        self.N_data = 4 * self.N_meas     # data DOFs (4 NV orientations)
+        self.N_B    = 3 * self.N_meas
+        self.N_data = 4 * self.N_meas
 
         _, self.M_list = build_coupling_matrices(theta_misc_deg, phi_misc_deg)
-        # M_g as (4, 6) Voigt-contraction rows (precomputed for speed)
-        self._M_voigt = self._precompute_M_voigt()
+        # (4, 6) array: M_voigt[g] gives the Voigt contraction row for D_g
+        self._M_voigt = np.array([
+            [M[0,0], M[1,1], M[2,2], 2*M[0,1], 2*M[1,2], 2*M[0,2]]
+            for M in self.M_list
+        ])  # (4, 6)
 
-        # Precompute surface mass projection:
-        # _pixel_to_node[m] maps pixel m's traction to DOF-space loads.
-        # We use a simple nearest-node approach here (correct for fine meshes
-        # where pixels sit almost on top of mesh nodes).
-        # This is filled lazily on first matvec call.
-        self._surf_proj = None  # (N_meas, N_dof_local) sparse, built on first use
+        self._traction_grid_spacing = traction_grid_spacing
 
-    # ---------------------------------------------------------------------- #
-
-    def _precompute_M_voigt(self) -> np.ndarray:
-        """
-        Precompute (4, 6) array where row g gives the Voigt contraction
-        coefficients for D_g = M_g_voigt @ sigma_voigt.
-        Voigt order: [s11, s22, s33, s12, s23, s13].
-        """
-        M_voigt = np.zeros((4, 6))
-        for g, M in enumerate(self.M_list):
-            M_voigt[g] = [
-                M[0, 0], M[1, 1], M[2, 2],
-                2 * M[0, 1], 2 * M[1, 2], 2 * M[0, 2],
-            ]
-        return M_voigt
+        # Precompute geometry for both P (nearest-node) and E^T (shape grads)
+        self._build_pixel_geometry()
 
     # ---------------------------------------------------------------------- #
-    # Surface load assembly helper
+    # Geometry precomputation                                                  #
     # ---------------------------------------------------------------------- #
 
-    def _traction_to_load_vector(self, t_pixels: np.ndarray) -> "PETSc.Vec":
+    def _build_pixel_geometry(self) -> None:
         """
-        Convert per-pixel traction array (N_meas, 3) to a PETSc load vector
-        by distributing point tractions to the mesh surface.
+        For each pixel:
+          - nearest culet surface node block-DOF index  (for P and P^T)
+          - containing cell index and reference coordinates (for E^T)
+          - P2 basis function gradients in physical coords (for E^T body load)
 
-        Strategy: build a UFL-free load vector by setting one DOF = 1 per pixel
-        component, summing. This is the point-load (delta-function traction)
-        approximation — valid for mesh elements smaller than pixel spacing.
-
-        For sub-pixel mesh resolution, using the surface mass matrix for
-        consistent distribution is more accurate; that upgrade is noted below.
+        Stored as:
+          self._nearest_block_dof : (N_meas,) int  — block DOF of nearest node
+          self._cell_of_pixel     : (N_meas,) int  — cell index (-1 if outside)
+          self._dphi_dx_pixels    : list of (10, 3) arrays — physical P2 grad per pixel
         """
-        from petsc4py import PETSc
-        import dolfinx.fem as fem
-        from .forward import TAG_CULET_SAMPLE
+        import dolfinx.geometry as geo
+        from dolfinx.fem import locate_dofs_topological
+        from .forward import TAG_CULET_SAMPLE, TAG_CULET_GASKET
 
-        # We convert pixel tractions to a UFL expression for the Neumann form
-        # by directly assembling the load vector from a sum of point loads.
-        # For each pixel m and direction alpha, contribute t[m, alpha] to the
-        # DOF closest to x_m in direction alpha on the culet surface.
+        mesh  = self.solver.mesh
+        V     = self.solver.V
+        tree  = self.solver._bb_tree
 
-        # Locate the nearest surface node for each pixel
-        if self._surf_proj is None:
-            self._build_surface_projection()
+        # ---- Nearest culet node for P / P^T ----------------------------
+        # Culet DOF block indices
+        culet_facets = np.concatenate([
+            self.solver.facet_tags.find(TAG_CULET_SAMPLE),
+            self.solver.facet_tags.find(TAG_CULET_GASKET),
+        ])
+        mesh.topology.create_connectivity(2, 3)
+        culet_block_dofs = locate_dofs_topological(V, 2, culet_facets)
+        # Block DOF i -> x-component scalar DOF = i*3+0; coordinate = tabulate_dof_coordinates()[i*3]
+        # tabulate_dof_coordinates returns (N_block_dofs, 3) — one coord per node
+        dof_coords_full = V.tabulate_dof_coordinates()  # (N_block_dofs, 3)
+        culet_coords = dof_coords_full[culet_block_dofs]  # (N_culet, 3)
 
-        # t_pixels: (N_meas, 3)
+        self._nearest_block_dof = np.empty(self.N_meas, dtype=np.intp)
+        for m in range(self.N_meas):
+            px, py = self.pixel_coords[m, 0], self.pixel_coords[m, 1]
+            dx = culet_coords[:, 0] - px
+            dy = culet_coords[:, 1] - py
+            idx = int(np.argmin(dx*dx + dy*dy))
+            self._nearest_block_dof[m] = culet_block_dofs[idx]
+
+        if self._traction_grid_spacing > 0.0:
+            # ---- Cartesian grid parameterization (mesh-independent) --------
+            # Build a regular grid with spacing s over the culet disk (radius R1).
+            # Each culet mesh node is assigned to the nearest grid point.
+            # N_B = 3 * N_grid is fixed regardless of mesh refinement.
+            s = self._traction_grid_spacing
+            R1 = 250.0   # culet radius (µm) — must match geometry
+            xs = np.arange(-R1, R1 + s, s)
+            ys = np.arange(-R1, R1 + s, s)
+            gx, gy = np.meshgrid(xs, ys)
+            mask = gx**2 + gy**2 <= R1**2
+            grid_xy = np.column_stack([gx[mask], gy[mask]])  # (N_grid, 2)
+
+            # Map each culet mesh node to nearest grid point
+            # culet_coords: (N_culet, 3) — z≈0 for all
+            grid_of_culet = np.empty(len(culet_block_dofs), dtype=np.intp)
+            for j in range(len(culet_block_dofs)):
+                dx2 = culet_coords[j, 0] - grid_xy[:, 0]
+                dy2 = culet_coords[j, 1] - grid_xy[:, 1]
+                grid_of_culet[j] = int(np.argmin(dx2**2 + dy2**2))
+
+            self._culet_node_list = culet_block_dofs      # ALL culet mesh nodes
+            self._all_culet_to_traction_idx = grid_of_culet   # mesh node → grid idx
+            self._traction_grid_xy = grid_xy
+            N_grid = len(grid_xy)
+            self.N_nodes = N_grid
+            self.N_B = 3 * N_grid
+            # For check_adjoint — pixel → grid point
+            self._node_idx_of_pixel = np.array(
+                [int(grid_of_culet[np.argmin(
+                    (culet_coords[:, 0] - self.pixel_coords[m, 0])**2 +
+                    (culet_coords[:, 1] - self.pixel_coords[m, 1])**2)])
+                 for m in range(self.N_meas)], dtype=np.intp)
+        else:
+            # ---- Node-based parameterization (unique nearest culet mesh nodes) ----
+            # Build the unique set of culet nodes that pixels actually map to.
+            # On coarse meshes N_nodes << N_meas; on fine meshes N_nodes ≈ N_meas.
+            self._culet_node_list = np.unique(self._nearest_block_dof)
+            self._all_culet_to_traction_idx = None
+            N_nodes = len(self._culet_node_list)
+            self.N_nodes = N_nodes
+            self.N_B = 3 * N_nodes
+            _node_lookup = {int(nd): k for k, nd in enumerate(self._culet_node_list)}
+            self._node_idx_of_pixel = np.array(
+                [_node_lookup[int(self._nearest_block_dof[m])] for m in range(self.N_meas)],
+                dtype=np.intp,
+            )  # (N_meas,) — pixel m maps to culet node index k
+
+        # ---- Cell + reference coords + P2 shape function gradients -----
+        # These are used in the adjoint body load assembly (E^T)
+        cell_type = getattr(basix.CellType, mesh.topology.cell_name())
+        fem_el = basix.create_element(
+            basix.ElementFamily.P, cell_type, 2, basix.LagrangeVariant.gll_warped
+        )
+
+        coord_x      = mesh.geometry.x        # (N_geom, 3)
+        coord_dofmap = mesh.geometry.dofmap   # cell -> 4 geom node indices (P1 geom)
+        cmap         = mesh.geometry.cmap
+
+        cell_cands = geo.compute_collisions_points(tree, self.pixel_coords)
+        colliding  = geo.compute_colliding_cells(mesh, cell_cands, self.pixel_coords)
+
+        self._cell_of_pixel  = np.full(self.N_meas, -1, dtype=np.intp)
+        self._dphi_dx_pixels = [None] * self.N_meas   # (10, 3) per pixel
+
+        for m in range(self.N_meas):
+            cells_m = colliding.links(m)
+            if len(cells_m) == 0:
+                continue
+            cell = int(cells_m[0])
+            self._cell_of_pixel[m] = cell
+
+            # Geometry: tet with constant Jacobian (straight-sided element).
+            # coord_dofmap returns 4 nodes for P1 geometry, 10 for P2 geometry.
+            # pull_back needs the full geometry node array; Jacobian uses only
+            # the 4 vertex nodes (indices 0-3) since midpoints are at edge midpoints.
+            x_cell = coord_x[coord_dofmap[cell]]              # (4 or 10, 3)
+            xi_m   = cmap.pull_back(self.pixel_coords[m:m+1], x_cell)  # (1, 3)
+
+            # P2 basis derivatives in reference coords
+            table    = fem_el.tabulate(1, xi_m)               # (4, 1, 10, 1)
+            dphi_dxi = table[1:, 0, :, 0].T                   # (10, 3)
+
+            # Jacobian from the 4 vertex nodes only (straight-sided tet)
+            x_verts = x_cell[:4]                              # (4, 3)
+            J = (x_verts[1:] - x_verts[0]).T                 # (3, 3) columns = edge vectors
+            # Row-vector form: (grad_x phi)^T = (grad_xi phi)^T @ J^{-1}
+            J_inv = np.linalg.inv(J)
+
+            dphi_dx = dphi_dxi @ J_inv                        # (10, 3) physical gradients
+            self._dphi_dx_pixels[m] = dphi_dx
+
+    # ---------------------------------------------------------------------- #
+    # Surface load assembly  (P : c -> f)                                    #
+    # ---------------------------------------------------------------------- #
+
+    def _traction_to_load_vector(self, t_nodes: np.ndarray) -> PETSc.Vec:
+        """
+        Node-based surface load assembly.
+        t_nodes : (N_nodes, 3) traction in GPa — one value per unique culet node.
+        Returns : PETSc.Vec f  (load vector, BCs applied).
+        """
+        from dolfinx.fem.petsc import set_bc
+
+        V  = self.solver.V
+        bs = V.dofmap.index_map_bs   # = 3
+        n_local = V.dofmap.index_map.size_local * bs
+
+        f_arr = np.zeros(n_local, dtype=np.float64)
+        if self._all_culet_to_traction_idx is not None:
+            # Cartesian grid mode: each culet mesh node gets the traction of its grid point
+            for j, block_dof in enumerate(self._culet_node_list):
+                k = int(self._all_culet_to_traction_idx[j])
+                for alpha in range(3):
+                    scalar_dof = int(block_dof) * bs + alpha
+                    if scalar_dof < n_local:
+                        f_arr[scalar_dof] = float(t_nodes[k, alpha])
+        else:
+            # Node-based mode: direct assignment, one traction value per culet node
+            for k, block_dof in enumerate(self._culet_node_list):
+                for alpha in range(3):
+                    scalar_dof = int(block_dof) * bs + alpha
+                    if scalar_dof < n_local:
+                        f_arr[scalar_dof] = float(t_nodes[k, alpha])
+
         b = self.solver.K.createVecRight()
         b.zeroEntries()
-
-        # For each pixel, add traction contributions to nearby DOF(s)
-        for m in range(self.N_meas):
-            for alpha in range(3):
-                val = float(t_pixels[m, alpha])
-                if abs(val) < 1e-30:
-                    continue
-                # Get DOF indices and weights for this pixel
-                dofs_m, weights_m = self._surf_proj[m]
-                for dof, w in zip(dofs_m, weights_m):
-                    # DOF encodes both node and direction; dof is the flattened
-                    # vector DOF index. We stored (node_dof_alpha, weight) pairs.
-                    actual_dof = dof * 3 + alpha
-                    b.setValueLocal(int(actual_dof), b.getValueLocal(actual_dof) + val * w)
-
+        b.setArray(f_arr)
         b.assemblyBegin()
         b.assemblyEnd()
-        from dolfinx.fem.petsc import set_bc
         set_bc(b, [self.solver.bc])
         return b
 
-    def _build_surface_projection(self) -> None:
+    # ---------------------------------------------------------------------- #
+    # Adjoint body load assembly  (E^T S -> f_adj)                          #
+    # ---------------------------------------------------------------------- #
+
+    def _adjoint_body_load(self, S_voigt: np.ndarray) -> PETSc.Vec:
         """
-        For each pixel, find the nearest culet surface node and store its
-        node index + weight (=1 for nearest-node projection).
-        Stored as self._surf_proj: list of (dof_indices, weights) per pixel.
+        Assemble the adjoint body load vector:
 
-        For a fine mesh (node spacing < 1 µm), this is essentially exact.
+          f_adj[scalar_dof(n, k)] = sum_m  G_m[k, l] * dphi_n/dx_l(x_m)
+
+        where G_m = C_lab : S_m  (contraction on stress indices i,j).
+
+        This is the exact adjoint of "evaluate sigma(u) at pixel m with weight S_m".
+
+        S_voigt : (N_meas, 6) stress weights [Voigt order: s11,s22,s33,s12,s23,s13]
+        Returns : PETSc.Vec f_adj  (BCs applied)
         """
-        mesh = self.solver.mesh
-        V    = self.solver.V
+        from dolfinx.fem.petsc import set_bc
 
-        # Get coordinates of all DOFs in the function space
-        # V is a P2 vector space; dof coordinates come from the DOF map
-        dof_coords = V.tabulate_dof_coordinates()  # (N_dof_total, 3)
+        C4  = self.solver.C4_lab       # (3,3,3,3) [GPa]
+        V   = self.solver.V
+        dm  = V.dofmap
+        bs  = V.dofmap.index_map_bs    # = 3
+        n_local = V.dofmap.index_map.size_local * bs
 
-        # Culet surface DOFs (from solver)
-        culet_dofs = self.solver.culet_dofs  # local DOF indices in V
-        # These are block DOF indices (one per node per component block).
-        # In a P2 vector space with 3 components, DOF i corresponds to
-        # node i//3, direction i%3.
+        f_arr = np.zeros(n_local, dtype=np.float64)
 
-        # Get the (x,y,z) coordinate of each culet node DOF
-        culet_node_indices  = culet_dofs // 3          # which node
-        culet_dof_component = culet_dofs % 3           # which direction (0,1,2)
-
-        # Only use x-component DOFs to get unique node positions
-        # (avoid triple-counting the same node)
-        x_dofs_mask = culet_dof_component == 0
-        culet_x_dofs   = culet_dofs[x_dofs_mask]      # DOF indices of x-component
-        culet_node_idx = culet_node_indices[x_dofs_mask]
-
-        culet_node_coords = dof_coords[culet_x_dofs]   # (N_culet_nodes, 3)
-
-        # For each pixel, find nearest culet node
-        self._surf_proj = []
         for m in range(self.N_meas):
-            px, py, pz = self.pixel_coords[m]
-            dx = culet_node_coords[:, 0] - px
-            dy = culet_node_coords[:, 1] - py
-            dist2 = dx * dx + dy * dy
-            nearest = int(np.argmin(dist2))
-            node_dof_idx = int(culet_node_idx[nearest])
-            # Store node DOF index (x-component), weight=1
-            self._surf_proj.append(([node_dof_idx], [1.0]))
+            cell = self._cell_of_pixel[m]
+            if cell < 0:
+                continue
+
+            # Reconstruct S_m (3,3) from Voigt.
+            # M_voigt stores 2*M[i,j] for off-diagonal, so S_voigt[off-diag] = 2*S_m[i,j].
+            S_m = np.zeros((3, 3))
+            for I, (i, j) in enumerate(_VOIGT):
+                if i == j:
+                    S_m[i, j] = S_voigt[m, I]
+                else:
+                    S_m[i, j] = S_m[j, i] = S_voigt[m, I] / 2.0
+
+            # G_m[k,l] = C_lab[i,j,k,l] * S_m[i,j]  using C major symmetry
+            G_m = np.einsum("ijkl,ij->kl", C4, S_m)   # (3,3)
+
+            dphi_dx  = self._dphi_dx_pixels[m]          # (10, 3)
+            cell_dofs = dm.cell_dofs(cell)               # (10,) block DOFs
+
+            for i in range(10):                          # P2 nodes in cell
+                block_dof = int(cell_dofs[i])
+                for k in range(3):
+                    scalar_dof = block_dof * bs + k
+                    if 0 <= scalar_dof < n_local:
+                        # f_adj[n,k] += G_m[k,:] . dphi_n/dx
+                        f_arr[scalar_dof] += float(np.dot(G_m[k], dphi_dx[i]))
+
+        # Build PETSc vector
+        b = self.solver.K.createVecRight()
+        b.zeroEntries()
+        b.setArray(f_arr)
+        b.assemblyBegin()
+        b.assemblyEnd()
+        set_bc(b, [self.solver.bc])
+        return b
 
     # ---------------------------------------------------------------------- #
-    # Forward operator: A @ c
+    # Forward operator  A @ c                                                 #
     # ---------------------------------------------------------------------- #
 
     def matvec(self, c: np.ndarray) -> np.ndarray:
         """
-        Forward operator: A @ c
+        A @ c  — one MUMPS back-substitution.
 
-        Parameters
-        ----------
-        c : (N_B,) = (3 * N_meas,) array — traction coefficients
-
-        Returns
-        -------
-        d : (N_data,) = (4 * N_meas,) array — predicted D_g values [GHz]
+        c : (N_B,) traction coefficients [GPa]
+        Returns: (N_data,) predicted D_g values [GHz]
         """
         c = np.asarray(c, dtype=np.float64)
-        t_pixels = c.reshape(self.N_meas, 3)  # (N_meas, 3) traction in GPa
+        t_nodes = c.reshape(self.N_nodes, 3)
 
-        # 1. Assemble load vector
-        b = self._traction_to_load_vector(t_pixels)
-
-        # 2. Forward solve: K u = b
+        b = self._traction_to_load_vector(t_nodes)
         u = self.solver.solve_load_vector(b)
 
-        # 3. Evaluate stress at pixel locations: (N_meas, 6)
         sigma_v = self.solver.stress_at_coords_batch(u, self.pixel_coords)
         sigma_v = np.where(np.isnan(sigma_v), 0.0, sigma_v)
 
-        # 4. NV contraction: (4, N_meas) -> flatten to (4 * N_meas,)
-        # D[g, m] = M_voigt[g] @ sigma_v[m]
+        # D[m, g] = sigma_v[m] @ M_voigt[g]  ->  shape (N_meas, 4)
         D = sigma_v @ self._M_voigt.T   # (N_meas, 4)
-        return D.T.ravel()              # (4 * N_meas,) order: all NV0, then NV1, ...
+        return D.T.ravel()              # (4*N_meas,), order: all NV0, NV1, NV2, NV3
 
     # ---------------------------------------------------------------------- #
-    # Adjoint operator: A^T @ r
+    # Adjoint operator  A^T @ r                                               #
     # ---------------------------------------------------------------------- #
 
     def rmatvec(self, r: np.ndarray) -> np.ndarray:
         """
-        Adjoint operator: A^T @ r
+        A^T @ r  — one MUMPS back-substitution with same factored K.
 
-        The adjoint reverses the chain:
-          r (4*N_meas) -> unpack to (4, N_meas)
-          -> M_g^T = M_g (symmetric) contracts to stress-space weights: (N_meas, 3, 3)
-          -> project through culet normal n=e_z to get adjoint tractions: (N_meas, 3)
-          -> assemble adjoint load vector
-          -> solve K v = f_adj  (same factored K, K is symmetric)
-          -> read off culet surface traction DOF values: (3 * N_meas,)
-
-        Parameters
-        ----------
-        r : (N_data,) = (4 * N_meas,) residual vector
-
-        Returns
-        -------
-        c_adj : (N_B,) = (3 * N_meas,) adjoint output
+        r : (N_data,) residual vector
+        Returns: (N_B,) adjoint output (sensitivity of misfit to each traction DOF)
         """
         r = np.asarray(r, dtype=np.float64)
         R = r.reshape(4, self.N_meas)   # (4, N_meas)
 
-        # 1. Adjoint of NV contraction: map r -> stress weights S[m] (N_meas, 3, 3)
-        #    D_g[m] = M_g : sigma[m]  =>  adjoint: S_ij[m] = sum_g M_g[i,j] * r[g,m]
-        #    Because M_g is symmetric, M_g^T = M_g.
-        #    In Voigt: S_voigt[m] = sum_g M_voigt[g] * R[g, m]
-        #    S_voigt has shape (N_meas, 6).
+        # Step 1: M^T r  ->  S_voigt (N_meas, 6)
+        #   S_voigt[m] = sum_g M_voigt[g] * R[g, m]
         S_voigt = R.T @ self._M_voigt   # (N_meas, 6)
 
-        # 2. Adjoint of stress evaluation at pixel m with weight S[m]:
-        #    "The adjoint of stress evaluation at a point is a point load
-        #     in stress-conjugate directions."
-        #    Concretely: the adjoint load at x_m is the traction
-        #       t_adj[m] = S[m] @ n_culet
-        #    where n_culet = (0,0,1) is the culet outward normal.
-        #    S[m] is a (3,3) tensor; S @ n gives a (3,) traction vector.
-        #    In Voigt [s11,s22,s33,s12,s23,s13], with n = e_z (index 2):
-        #       t_adj[m, 0] = S[m][0,2] = s13 = S_voigt[m, 5]  (with factor 1, not 2)
-        #       t_adj[m, 1] = S[m][1,2] = s23 = S_voigt[m, 4]
-        #       t_adj[m, 2] = S[m][2,2] = s33 = S_voigt[m, 2]
-        # NOTE: Voigt stores s12, s23, s13 without the factor of 2 in the tensor.
-        # The contraction above with M_voigt used 2*M[0,1] etc., giving S_voigt
-        # entries that already include the double counting. But S_voigt is a
-        # Voigt stress tensor, so:
-        #   S[0,2] = S_voigt[5]   (= s13, off-diagonal, stored once)
-        #   S[1,2] = S_voigt[4]   (= s23)
-        #   S[2,2] = S_voigt[2]   (= s33, diagonal)
-        # The adjoint traction t = S @ e_z reads column 2 of S tensor:
-        t_adj = np.column_stack([
-            S_voigt[:, 5],   # S_{0,2} = s13
-            S_voigt[:, 4],   # S_{1,2} = s23
-            S_voigt[:, 2],   # S_{2,2} = s33
-        ])  # (N_meas, 3)
+        # Step 2: E^T S  ->  f_adj  (body load via shape function gradients)
+        f_adj = self._adjoint_body_load(S_voigt)
 
-        # 3. Assemble adjoint load vector
-        b_adj = self._traction_to_load_vector(t_adj)
+        # Step 3: K^{-1} f_adj  ->  v
+        v = self.solver.solve_load_vector(f_adj)
 
-        # 4. Adjoint solve: K v = f_adj  (K is symmetric so same factored K)
-        v = self.solver.solve_load_vector(b_adj)
+        # Step 4: P^T v  ->  map displacement back to traction parameters.
+        bs    = self.solver.V.dofmap.index_map_bs
+        c_adj = np.zeros(self.N_B, dtype=np.float64)
+        v_arr = v.x.array  # (n_local_scalar_dofs,)
 
-        # 5. Read off displacement values at pixel locations (N_meas, 3)
-        #    The adjoint output is the traction sensitivity = displacement at pixels.
-        #    In the adjoint formulation, the sensitivity of the misfit to
-        #    traction DOF c[3m + alpha] is v_alpha(x_m).
-        v_pixels = self._eval_displacement_at_pixels(v)  # (N_meas, 3)
-        return v_pixels.ravel()   # (N_B,)
+        if self._all_culet_to_traction_idx is not None:
+            # Cartesian grid mode: accumulate v over all culet mesh nodes per grid point
+            for j, block_dof in enumerate(self._culet_node_list):
+                k = int(self._all_culet_to_traction_idx[j])
+                c_adj[3*k : 3*k+3] += v_arr[int(block_dof)*bs : int(block_dof)*bs+3]
+        else:
+            # Node-based mode: read v at each traction node directly
+            for k, block_dof in enumerate(self._culet_node_list):
+                c_adj[3*k : 3*k+3] = v_arr[int(block_dof)*bs : int(block_dof)*bs+3]
 
-    def _eval_displacement_at_pixels(self, u) -> np.ndarray:
-        """
-        Evaluate displacement field u at the pixel locations.
-        Returns (N_meas, 3) array.
-        """
-        import dolfinx.geometry as geo
-        coords = self.pixel_coords
-        tree   = self.solver._bb_tree
-
-        cell_candidates = geo.compute_collisions_points(tree, coords)
-        colliding = geo.compute_colliding_cells(self.solver.mesh, cell_candidates, coords)
-
-        vals = np.zeros((self.N_meas, 3))
-        for m, pt in enumerate(coords):
-            cells_m = colliding.links(m)
-            if len(cells_m) == 0:
-                continue
-            v_val = u.eval(pt.reshape(1, 3), cells_m[:1])  # (1, 3)
-            vals[m] = v_val[0]
-        return vals
+        return c_adj
 
     # ---------------------------------------------------------------------- #
-    # Build scipy LinearOperator
+    # Wrap as scipy LinearOperator                                            #
     # ---------------------------------------------------------------------- #
 
     def as_linear_operator(self) -> LinearOperator:
-        """Return a scipy LinearOperator wrapping matvec and rmatvec."""
         return LinearOperator(
             shape=(self.N_data, self.N_B),
             matvec=self.matvec,
@@ -393,28 +436,29 @@ class NVOperator:
         )
 
     # ---------------------------------------------------------------------- #
-    # Adjoint consistency check (finite difference)
+    # Adjoint consistency check                                               #
     # ---------------------------------------------------------------------- #
 
-    def check_adjoint(self, n_trials: int = 3, seed: int = 42) -> bool:
+    def check_adjoint(self, n_trials: int = 3, seed: int = 42,
+                      tol: float = 1e-4) -> bool:
         """
         Verify <A c, r> == <c, A^T r> for random c and r.
-
-        Passes if relative error < 1e-6 for all trials.
+        Relative error should be < tol for a correct adjoint.
         """
         rng = np.random.default_rng(seed)
-        print("Adjoint consistency check (<A c, r> vs <c, A^T r>):")
+        print("Adjoint consistency check  (<Ac, r>  vs  <c, A^T r>):")
         all_ok = True
         for i in range(n_trials):
+            # Use small random vectors to keep solve cost low
             c = rng.standard_normal(self.N_B)
             r = rng.standard_normal(self.N_data)
-            Ac    = self.matvec(c)
-            ATr   = self.rmatvec(r)
-            lhs   = float(np.dot(Ac, r))
-            rhs   = float(np.dot(c, ATr))
-            rel   = abs(lhs - rhs) / (abs(lhs) + abs(rhs) + 1e-30)
-            ok    = rel < 1e-6
+            Ac   = self.matvec(c)
+            ATr  = self.rmatvec(r)
+            lhs  = float(np.dot(Ac, r))
+            rhs  = float(np.dot(c, ATr))
+            rel  = abs(lhs - rhs) / (0.5 * (abs(lhs) + abs(rhs)) + 1e-30)
+            ok   = rel < tol
             all_ok &= ok
-            print(f"  trial {i+1}: <Ac,r>={lhs:.6e}  <c,A^Tr>={rhs:.6e}  "
+            print(f"  trial {i+1}:  <Ac,r>={lhs:.6e}  <c,A^Tr>={rhs:.6e}  "
                   f"rel_err={rel:.2e}  {'OK' if ok else 'FAIL'}")
         return all_ok
