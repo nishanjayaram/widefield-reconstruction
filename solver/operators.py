@@ -84,12 +84,18 @@ class NVOperator:
         theta_misc_deg: float = -3.5,
         phi_misc_deg: float   = 174.4,
         traction_grid_spacing: float = 0.0,
+        sample_grid_spacing: float = 0.0,
     ) -> None:
         """
         traction_grid_spacing : µm — if > 0, use a Cartesian traction grid
-            with this spacing instead of culet mesh nodes. Gives N_B independent
-            of mesh refinement; spacing ~10 µm → ~1963 grid points → N_B=5889.
+            over the full culet disk with this spacing (gasket zone spacing).
             If 0 (default), use unique culet mesh nodes nearest to pixels.
+        sample_grid_spacing : µm — if > 0 and < traction_grid_spacing, build a
+            two-zone grid: fine spacing inside the sample ellipse, coarse spacing
+            (traction_grid_spacing) in the gasket annulus. This increases spatial
+            resolution in the well-constrained sample region without inflating N_B.
+            Example: sample_grid_spacing=3.0, traction_grid_spacing=10.0 →
+            ~1300 fine pts + ~1850 coarse pts → N_B ≈ 9450.
         """
         self.solver = solver
 
@@ -112,6 +118,7 @@ class NVOperator:
         ])  # (4, 6)
 
         self._traction_grid_spacing = traction_grid_spacing
+        self._sample_grid_spacing   = sample_grid_spacing
 
         # Precompute geometry for both P (nearest-node) and E^T (shape grads)
         self._build_pixel_geometry()
@@ -163,16 +170,44 @@ class NVOperator:
 
         if self._traction_grid_spacing > 0.0:
             # ---- Cartesian grid parameterization (mesh-independent) --------
-            # Build a regular grid with spacing s over the culet disk (radius R1).
+            # Build a grid over the culet disk (radius R1).
             # Each culet mesh node is assigned to the nearest grid point.
             # N_B = 3 * N_grid is fixed regardless of mesh refinement.
-            s = self._traction_grid_spacing
-            R1 = 250.0   # culet radius (µm) — must match geometry
-            xs = np.arange(-R1, R1 + s, s)
-            ys = np.arange(-R1, R1 + s, s)
-            gx, gy = np.meshgrid(xs, ys)
-            mask = gx**2 + gy**2 <= R1**2
-            grid_xy = np.column_stack([gx[mask], gy[mask]])  # (N_grid, 2)
+            s_gasket = self._traction_grid_spacing
+            s_sample = (self._sample_grid_spacing
+                        if self._sample_grid_spacing > 0.0 else s_gasket)
+            R1    = 250.0   # culet radius (µm) — must match geometry
+            ELL_A = 72.0    # sample chamber semi-axes (µm)
+            ELL_B = 50.0
+
+            if s_sample < s_gasket - 1e-6:
+                # Two-zone non-uniform grid: fine inside sample ellipse,
+                # coarse in gasket annulus.  No overlap between zones.
+                xs_f = np.arange(-ELL_A, ELL_A + s_sample, s_sample)
+                ys_f = np.arange(-ELL_B, ELL_B + s_sample, s_sample)
+                gx_f, gy_f = np.meshgrid(xs_f, ys_f)
+                mask_ell = (gx_f / ELL_A)**2 + (gy_f / ELL_B)**2 <= 1.0
+                fine_pts = np.column_stack([gx_f[mask_ell], gy_f[mask_ell]])
+
+                xs_c = np.arange(-R1, R1 + s_gasket, s_gasket)
+                ys_c = np.arange(-R1, R1 + s_gasket, s_gasket)
+                gx_c, gy_c = np.meshgrid(xs_c, ys_c)
+                mask_disk    = gx_c**2 + gy_c**2 <= R1**2
+                mask_gasket  = (gx_c / ELL_A)**2 + (gy_c / ELL_B)**2 > 1.0
+                coarse_pts = np.column_stack([gx_c[mask_disk & mask_gasket],
+                                              gy_c[mask_disk & mask_gasket]])
+
+                grid_xy = np.vstack([fine_pts, coarse_pts])   # (N_grid, 2)
+                print(f"  Two-zone traction grid: {len(fine_pts)} sample pts "
+                      f"({s_sample} µm) + {len(coarse_pts)} gasket pts "
+                      f"({s_gasket} µm) = {len(grid_xy)} total  →  N_B={3*len(grid_xy)}")
+            else:
+                # Uniform grid over full culet disk
+                xs = np.arange(-R1, R1 + s_gasket, s_gasket)
+                ys = np.arange(-R1, R1 + s_gasket, s_gasket)
+                gx, gy = np.meshgrid(xs, ys)
+                mask = gx**2 + gy**2 <= R1**2
+                grid_xy = np.column_stack([gx[mask], gy[mask]])  # (N_grid, 2)
 
             # Map each culet mesh node to nearest grid point
             # culet_coords: (N_culet, 3) — z≈0 for all

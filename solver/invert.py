@@ -343,13 +343,17 @@ if __name__ == "__main__":
         run_synthetic_test(mesh_path=mesh)
 
     elif mode == "real":
-        mesh = sys.argv[2] if len(sys.argv) > 2 else "mesh/anvil_fine_tet.msh"
-        data = sys.argv[3] if len(sys.argv) > 3 else "data"
-        lam  = float(sys.argv[4]) if len(sys.argv) > 4 else 1e-3
+        mesh        = sys.argv[2] if len(sys.argv) > 2 else "mesh/anvil_fine_tet.msh"
+        data        = sys.argv[3] if len(sys.argv) > 3 else "data"
+        lam         = float(sys.argv[4]) if len(sys.argv) > 4 else 1e-3
+        s_gasket    = float(sys.argv[5]) if len(sys.argv) > 5 else 10.0
+        s_sample    = float(sys.argv[6]) if len(sys.argv) > 6 else 3.0
 
         solver  = ForwardSolver(mesh, verbose=True)
         coords, nv_data = load_nv_data(data)
-        op      = NVOperator(solver, coords)
+        op      = NVOperator(solver, coords,
+                             traction_grid_spacing=s_gasket,
+                             sample_grid_spacing=s_sample)
 
         # Adjoint check before inverting
         op.check_adjoint(n_trials=2)
