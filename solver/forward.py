@@ -89,12 +89,15 @@ class ForwardSolver:
         # ------------------------------------------------------------------ #
         if verbose:
             print(f"Loading mesh: {self.mesh_path}")
-        mesh_data = gmshio.read_from_msh(
-            str(self.mesh_path), self.comm, rank=0, gdim=3
-        )
-        self.mesh       = mesh_data.mesh
-        self.cell_tags  = mesh_data.cell_tags
-        self.facet_tags = mesh_data.facet_tags
+        if self.mesh_path.suffix == ".xdmf":
+            self.mesh, self.cell_tags, self.facet_tags = self._load_xdmf()
+        else:
+            mesh_data = gmshio.read_from_msh(
+                str(self.mesh_path), self.comm, rank=0, gdim=3
+            )
+            self.mesh       = mesh_data.mesh
+            self.cell_tags  = mesh_data.cell_tags
+            self.facet_tags = mesh_data.facet_tags
         if verbose:
             num_cells = self.mesh.topology.index_map(
                 self.mesh.topology.dim).size_global
@@ -210,6 +213,92 @@ class ForwardSolver:
     # ---------------------------------------------------------------------- #
     # Public properties                                                       #
     # ---------------------------------------------------------------------- #
+
+    def _load_xdmf(self):
+        """
+        Load mesh from an XDMF file produced by convert_msh_to_xdmf.py and
+        classify boundary facets geometrically (bounding box).
+
+        The COMSOL surface elements in the MSH are not guaranteed to match the
+        tet10 face topology (quad→tri split inconsistency), so we skip them and
+        classify boundary facets directly from the volume mesh geometry.
+
+        DOLFINx resolves HDF5 paths relative to CWD, so we temporarily chdir
+        into the directory containing the XDMF/H5 files.
+        """
+        import os
+        from dolfinx.io import XDMFFile
+        from dolfinx.mesh import locate_entities_boundary, meshtags
+
+        stem = self.mesh_path.with_suffix("")
+        if self.mesh_path.name.endswith("_mesh.xdmf"):
+            mesh_xdmf = self.mesh_path
+        else:
+            mesh_xdmf = stem.parent / (stem.name + "_mesh.xdmf")
+
+        orig_dir = Path(os.getcwd())
+        os.chdir(mesh_xdmf.parent)
+        try:
+            with XDMFFile(self.comm, mesh_xdmf.name, "r") as f:
+                mesh = f.read_mesh(name="Grid")
+        finally:
+            os.chdir(orig_dir)
+
+        # Dummy cell_tags: all cells are bulk (tag 1)
+        mesh.topology.create_entities(mesh.topology.dim)
+        n_cells = mesh.topology.index_map(mesh.topology.dim).size_local
+        cell_indices = np.arange(n_cells, dtype=np.int32)
+        cell_vals    = np.ones(n_cells, dtype=np.int32)
+        cell_tags = meshtags(mesh, mesh.topology.dim, cell_indices, cell_vals)
+
+        # Classify boundary facets geometrically
+        mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+        fdim = mesh.topology.dim - 1
+
+        ELL_A, ELL_B = 72.0, 50.0
+        tol = 1.0   # µm
+
+        # Determine table z from mesh extents (most negative z coordinate)
+        z_min = float(mesh.geometry.x[:, 2].min())
+        z_max = float(mesh.geometry.x[:, 2].max())   # should be ~0
+
+        def on_culet(x):
+            return np.abs(x[2] - z_max) < tol
+
+        def in_sample(x):
+            return on_culet(x) & ((x[0] / ELL_A)**2 + (x[1] / ELL_B)**2 <= 1.0)
+
+        def in_gasket(x):
+            return on_culet(x) & ((x[0] / ELL_A)**2 + (x[1] / ELL_B)**2 > 1.0)
+
+        def on_table(x):
+            return np.abs(x[2] - z_min) < tol
+
+        def on_facet(x):
+            return ~on_culet(x) & ~on_table(x)
+
+        groups = {
+            TAG_CULET_SAMPLE: locate_entities_boundary(mesh, fdim, in_sample),
+            TAG_CULET_GASKET: locate_entities_boundary(mesh, fdim, in_gasket),
+            TAG_TABLE:        locate_entities_boundary(mesh, fdim, on_table),
+            TAG_FACET:        locate_entities_boundary(mesh, fdim, on_facet),
+        }
+        for name, tag in [(TAG_CULET_SAMPLE, "culet_sample"),
+                          (TAG_CULET_GASKET, "culet_gasket"),
+                          (TAG_TABLE, "table"), (TAG_FACET, "facet")]:
+            if self.verbose:
+                print(f"  {tag}: {len(groups[name])} facets")
+
+        all_facets = np.concatenate(list(groups.values()))
+        all_tags   = np.concatenate([
+            np.full(len(v), k, dtype=np.int32)
+            for k, v in groups.items()
+        ])
+        sort_idx   = np.argsort(all_facets)
+        facet_tags = meshtags(mesh, fdim,
+                              all_facets[sort_idx], all_tags[sort_idx])
+
+        return mesh, cell_tags, facet_tags
 
     @property
     def culet_dofs(self) -> np.ndarray:

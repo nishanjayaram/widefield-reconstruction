@@ -161,18 +161,19 @@ def build_mesh(output_path: str = "mesh/anvil.msh", verbose: bool = True) -> Non
     # 6. Mesh size fields
     #
     #  Strategy:
-    #    F1  Box field — LC_GASKET inside the cap layer (z ∈ [−TCAP, 0]),
-    #        LC_TABLE outside.  Transition band = 5 µm below the cap.
-    #        This makes the bulk coarse without the gradation artefacts
-    #        that a Distance-based field produces.
-    #    F2  Distance from the sample-chamber surface
-    #    F3  Threshold on F2 — refines sample chamber to LC_SAMPLE.
-    #        SizeMax = LC_TABLE so this field does NOT force a fine mesh
-    #        outside the sample-chamber zone.
-    #    F4  Min(F1, F3) — take the finest applicable size everywhere.
+    #    F1  Box — cap layer at LC_GASKET, bulk at LC_TABLE.
+    #        Covers the full culet disk (radius R1) from z=-TCAP to z=0.
+    #    F2  Box — sample ellipse region at LC_SAMPLE.
+    #        Covers x ∈ [-ELL_A-5, ELL_A+5], y ∈ [-ELL_B-5, ELL_B+5],
+    #        z ∈ [-TCAP-5, 1].  This is rectangular (not elliptic) so
+    #        corner regions just outside the ellipse get LC_SAMPLE too —
+    #        a minor waste but avoids the Distance/Threshold pitfall where
+    #        Gmsh's Distance field measures from boundary *curves* not from
+    #        the surface interior, leaving the sample centre under-refined.
+    #    F3  Min(F1, F2) — finest applicable size everywhere.
     # ------------------------------------------------------------------
 
-    # F1: Box — fine cap, coarse bulk
+    # F1: Box — cap at LC_GASKET, bulk at LC_TABLE
     f1 = gmsh.model.mesh.field.add("Box")
     gmsh.model.mesh.field.setNumber(f1, "VIn",       LC_GASKET)
     gmsh.model.mesh.field.setNumber(f1, "VOut",      LC_TABLE)
@@ -184,22 +185,25 @@ def build_mesh(output_path: str = "mesh/anvil.msh", verbose: bool = True) -> Non
     gmsh.model.mesh.field.setNumber(f1, "ZMax",      1.0)
     gmsh.model.mesh.field.setNumber(f1, "Thickness", 5.0)
 
-    # F2: distance from sample-chamber surface
-    f2 = gmsh.model.mesh.field.add("Distance")
-    gmsh.model.mesh.field.setNumbers(f2, "SurfacesList", culet_sample_tags)
+    # F2: Box — sample ellipse at LC_SAMPLE (rectangular approximation)
+    # ZMin = -(TCAP+1): fine mesh covers the cap + 1µm margin below.
+    # The +5 was too generous, making the fine 3D volume 7µm deep at 1µm,
+    # generating ~80k elements and causing Gmsh to spend 20+ min meshing.
+    f2 = gmsh.model.mesh.field.add("Box")
+    gmsh.model.mesh.field.setNumber(f2, "VIn",       LC_SAMPLE)
+    gmsh.model.mesh.field.setNumber(f2, "VOut",      LC_TABLE)
+    gmsh.model.mesh.field.setNumber(f2, "XMin",     -(ELL_A + 5))
+    gmsh.model.mesh.field.setNumber(f2, "XMax",      (ELL_A + 5))
+    gmsh.model.mesh.field.setNumber(f2, "YMin",     -(ELL_B + 5))
+    gmsh.model.mesh.field.setNumber(f2, "YMax",      (ELL_B + 5))
+    gmsh.model.mesh.field.setNumber(f2, "ZMin",     -(TCAP + 1))
+    gmsh.model.mesh.field.setNumber(f2, "ZMax",      1.0)
+    gmsh.model.mesh.field.setNumber(f2, "Thickness", 5.0)
 
-    # F3: refine sample chamber to LC_SAMPLE; SizeMax = LC_TABLE so it
-    #     doesn't force fine mesh away from the sample chamber
-    f3 = gmsh.model.mesh.field.add("Threshold")
-    gmsh.model.mesh.field.setNumber(f3, "InField",  f2)
-    gmsh.model.mesh.field.setNumber(f3, "SizeMin",  LC_SAMPLE)
-    gmsh.model.mesh.field.setNumber(f3, "SizeMax",  LC_TABLE)
-    gmsh.model.mesh.field.setNumber(f3, "DistMin",  0.0)
-    gmsh.model.mesh.field.setNumber(f3, "DistMax",  30.0)
-
-    # F4: take minimum of Box and sample-chamber Threshold
-    f4 = gmsh.model.mesh.field.add("Min")
-    gmsh.model.mesh.field.setNumbers(f4, "FieldsList", [f1, f3])
+    # F3: Min(F1, F2) — finest applicable size everywhere
+    f3 = gmsh.model.mesh.field.add("Min")
+    gmsh.model.mesh.field.setNumbers(f3, "FieldsList", [f1, f2])
+    f4 = f3   # alias so the setAsBackgroundMesh call below still works
 
     gmsh.model.mesh.field.setAsBackgroundMesh(f4)
 
@@ -213,7 +217,7 @@ def build_mesh(output_path: str = "mesh/anvil.msh", verbose: bool = True) -> Non
     # ------------------------------------------------------------------
     gmsh.option.setNumber("Mesh.Algorithm",   5)   # Delaunay (2-D)
     gmsh.option.setNumber("Mesh.Algorithm3D", 1)   # Delaunay (3-D)
-    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 0)  # skip slow Netgen opt; Delaunay quality is sufficient
 
     print("Generating 3-D mesh (P1 first, then promoted to P2)...")
     gmsh.model.mesh.generate(3)

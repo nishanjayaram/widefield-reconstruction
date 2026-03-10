@@ -46,10 +46,10 @@ def load_nv_data(data_dir: str | Path = "data") -> tuple[np.ndarray, np.ndarray]
     return coords, np.array(data_list)   # coords: (N,2), data: (4,N)
 
 
-def scatter_map(ax, x, y, v, title, cmap="RdBu_r", symmetric=False, unit=""):
+def scatter_map(ax, x, y, v, title, cmap="RdBu_r", symmetric=False, unit="", vlim=None):
     """Scatter plot colored by v on irregular pixel grid."""
     if symmetric:
-        vmax = np.nanpercentile(np.abs(v), 99)
+        vmax = vlim if vlim is not None else np.nanpercentile(np.abs(v), 99)
         norm = TwoSlopeNorm(vcenter=0, vmin=-vmax, vmax=vmax)
         sc = ax.scatter(x, y, c=v, cmap=cmap, norm=norm, s=1.5, rasterized=True)
     else:
@@ -276,18 +276,18 @@ def plot_Dg_scatter(
 # ---------------------------------------------------------------------------
 
 def plot_traction_field(
-    traction_coeffs: np.ndarray,   # (N_B,) = (3*N_nodes,)
-    node_coords: np.ndarray,       # (N_nodes, 3) — culet node positions
+    traction_coeffs: np.ndarray,   # (N_B,) = (3*N_grid,)
+    grid_xy: np.ndarray,           # (N_grid, 2) — traction grid xy positions
     out_dir: Path,
 ) -> None:
-    N_nodes = len(node_coords)
+    N_nodes = len(grid_xy)
     t = traction_coeffs[:3 * N_nodes].reshape(N_nodes, 3)
-    x, y = node_coords[:, 0], node_coords[:, 1]
+    x, y = grid_xy[:, 0], grid_xy[:, 1]
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     labels = ["t_x (GPa)", "t_y (GPa)", "t_z (GPa)"]
     for i, (ax, lab) in enumerate(zip(axes, labels)):
-        scatter_map(ax, x, y, t[:, i], lab, cmap="RdBu_r", symmetric=True, unit="GPa")
+        scatter_map(ax, x, y, t[:, i], lab, cmap="RdBu_r", symmetric=True, unit="GPa", vlim=10.0)
     fig.suptitle("Recovered surface traction on culet", fontsize=13)
     fig.tight_layout()
     out = out_dir / "traction_field.pdf"
@@ -361,23 +361,17 @@ def main():
     plot_Dg_comparison(D_measured, D_predicted, coords, out_dir)
     plot_Dg_scatter(D_measured, D_predicted, out_dir)
 
-    # Traction field: need culet node coords from mesh
-    try:
-        from solver.forward import ForwardSolver
-        from solver.operators import NVOperator
-        mesh_path = Path(args.solver).parent / "mesh" / "anvil_preview.msh"
-        if not mesh_path.exists():
-            mesh_path = Path("mesh/anvil_preview.msh")
-        _solver = ForwardSolver(str(mesh_path), verbose=False)
-        _op = NVOperator(_solver, coords)
-        node_coords = _solver.V.tabulate_dof_coordinates()[_op._culet_node_list]
-        if len(traction_coeffs) == 3 * len(node_coords):
-            plot_traction_field(traction_coeffs, node_coords, out_dir)
+    # Traction field: load saved grid coordinates
+    grid_xy_path = solver_dir / "traction_grid_xy.npy"
+    if grid_xy_path.exists():
+        grid_xy = np.load(grid_xy_path)
+        if len(traction_coeffs) == 3 * len(grid_xy):
+            plot_traction_field(traction_coeffs, grid_xy, out_dir)
         else:
             print(f"  Skipping traction plot: size mismatch "
-                  f"(coeffs {len(traction_coeffs)} vs 3*nodes {3*len(node_coords)})")
-    except Exception as e:
-        print(f"  Skipping traction plot: {e}")
+                  f"(coeffs {len(traction_coeffs)} vs 3*grid {3*len(grid_xy)})")
+    else:
+        print("  Skipping traction plot: traction_grid_xy.npy not found (re-run invert to generate)")
 
     print(f"\nAll plots saved to: {out_dir}/")
 

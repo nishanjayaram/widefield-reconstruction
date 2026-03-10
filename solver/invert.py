@@ -358,8 +358,10 @@ if __name__ == "__main__":
         # Adjoint check before inverting
         op.check_adjoint(n_trials=2)
 
-        result = run_lsqr(op, nv_data, lambda_reg=lam, max_iter=200)
+        result = run_lsqr(op, nv_data, lambda_reg=lam, max_iter=400)
         np.save("solver/traction_coeffs.npy", result["c"])
+        if hasattr(op, "_traction_grid_xy"):
+            np.save("solver/traction_grid_xy.npy", op._traction_grid_xy)
         print("Traction coefficients saved to solver/traction_coeffs.npy")
 
         # Reconstruct stress and save
